@@ -1,7 +1,7 @@
 {
   "name": "@mako10k/mcp-shell",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "MCP server interface for shell-server",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -10,10 +10,36 @@
   "exports": {
     ".": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "author": "mako10k",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mako10k/mcp-shell.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mako10k/mcp-shell/issues"
+  },
+  "homepage": "https://github.com/mako10k/mcp-shell#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.2",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.24.5",
     "@mako10k/shell-server": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
   }
 }
