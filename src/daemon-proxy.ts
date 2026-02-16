@@ -1,7 +1,7 @@
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 import { JSONRPCMessageSchema } from '@modelcontextprotocol/sdk/types.js';
 import * as fs from 'fs/promises';
-import { logger, UdsClientTransport } from '../../shell-server/src/runtime/index.js';
+import { logger, UdsClientTransport } from '@mako10k/shell-server/runtime';
 
 class ReadBuffer {
   private buffer: Buffer | undefined;

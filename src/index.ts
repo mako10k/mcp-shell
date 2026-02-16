@@ -2,7 +2,7 @@
 
 import { MCPShellServer } from './server.js';
 import { runDaemonProxy } from './daemon-proxy.js';
-import { createServerManager, logger } from '../../shell-server/src/runtime/index.js';
+import { createServerManager, logger } from '@mako10k/shell-server/runtime';
 import fs from 'fs/promises';
 
 async function getVersion(): Promise<string> {
@@ -33,6 +33,8 @@ function printHelp(version: string): void {
     'Options:',
     '  -h, --help           Show this help and exit',
     '  -v, --version        Show version and exit',
+    '  --daemon             Force-enable daemon mode',
+    '  --no-daemon          Disable daemon mode for this run',
     '',
     'Environment variables:',
     '  BACKOFFICE_ENABLED=true   Start localhost-only Backoffice UI (default: disabled)',
@@ -42,7 +44,7 @@ function printHelp(version: string): void {
     '  MCP_SHELL_DEFAULT_WORKDIR  Default working directory for shell_execute',
     '  MCP_SHELL_ALLOWED_WORKDIRS  Comma-separated allowed directories',
     '  MCP_DISABLED_TOOLS         Comma-separated tool names to disable',
-    '  MCP_SHELL_DAEMON_ENABLED=true  Enable daemon process separation',
+    '  MCP_SHELL_DAEMON_ENABLED=false Disable daemon process separation (default: enabled)',
     '  MCP_SHELL_USE_DAEMON_MCP=false  Disable MCP daemon proxy (default: enabled when daemon is on)',
     '  LOG_LEVEL=debug|info|warn|error  Log verbosity',
     '',
@@ -70,7 +72,12 @@ async function main() {
     return;
   }
 
-  const daemonEnabled = process.env['MCP_SHELL_DAEMON_ENABLED'] === 'true';
+  // Daemon mode is enabled by default to support auto-start/reattach.
+  // Users can opt-out via env or CLI.
+  const cliNoDaemon = argv.includes('--no-daemon');
+  const cliDaemon = argv.includes('--daemon');
+
+  const daemonEnabled = !cliNoDaemon && (cliDaemon || process.env['MCP_SHELL_DAEMON_ENABLED'] !== 'false');
   const useDaemonMcp = process.env['MCP_SHELL_USE_DAEMON_MCP'] !== 'false';
 
   if (daemonEnabled && useDaemonMcp) {

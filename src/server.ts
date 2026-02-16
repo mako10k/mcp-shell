@@ -39,7 +39,7 @@ import {
   type ShellToolRuntime,
   type ToolName,
   type ToolParams,
-} from '../../shell-server/src/runtime/index.js';
+} from '@mako10k/shell-server/runtime';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 
 // Tools can be disabled by specifying a comma-separated list in the

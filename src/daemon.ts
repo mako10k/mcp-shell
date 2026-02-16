@@ -2,7 +2,7 @@ import * as fs from 'fs/promises';
 import * as net from 'net';
 import * as path from 'path';
 
-import { logger, UdsServerTransport } from '../../shell-server/src/runtime/index.js';
+import { logger, UdsServerTransport } from '@mako10k/shell-server/runtime';
 import { MCPShellServer } from './server.js';
 
 const DAEMON_COMPONENT = 'mcp-daemon';
