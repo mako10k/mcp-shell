@@ -40,7 +40,8 @@ function printHelp(version: string): void {
     '  EXECUTION_BACKEND=local|remote  Select execution backend (default: local)',
     '  EXECUTOR_URL / EXECUTOR_HOST / EXECUTOR_PORT / EXECUTOR_TOKEN  Configure remote executor',
     '  MCP_SHELL_DEFAULT_WORKDIR  Default working directory for shell_execute',
-    '  MCP_SHELL_ALLOWED_WORKDIRS  Comma-separated allowed directories',
+    '  SHELL_SERVER_DEFAULT_WORKDIR  Compatible alias for default working directory',
+    '  SHELL_SERVER_ALLOWED_WORKDIRS  Comma-separated allowed directories',
     '  MCP_DISABLED_TOOLS         Comma-separated tool names to disable',
     '  LOG_LEVEL=debug|info|warn|error  Log verbosity',
     '',
@@ -75,17 +76,27 @@ async function main() {
     }
 
     const serverManager = createServerManager();
-    const cwd = process.env['MCP_SHELL_DEFAULT_WORKDIR'] || process.cwd();
+    const cwd = process.env['MCP_SHELL_DEFAULT_WORKDIR'] || process.env['SHELL_SERVER_DEFAULT_WORKDIR'] || process.cwd();
     const started = await serverManager.start({ cwd, allowExisting: true });
     const info = await serverManager.get({ serverId: started.serverId });
-    const mcpSocketPath =
-      info && typeof info === 'object' && 'mcpSocketPath' in info
-        ? (info as { mcpSocketPath?: string }).mcpSocketPath
+
+    let socketPath =
+      info && typeof info === 'object' && 'childSocketPath' in info
+        ? (info as { childSocketPath?: string }).childSocketPath
         : undefined;
-    const socketPath = mcpSocketPath || info?.socketPath;
 
     if (!socketPath) {
-      throw new Error('MCP daemon socket was not available from shell-server process.');
+      await serverManager.stop({ serverId: started.serverId, force: true });
+      const restarted = await serverManager.start({ cwd, allowExisting: false });
+      const restartedInfo = await serverManager.get({ serverId: restarted.serverId });
+      socketPath =
+        restartedInfo && typeof restartedInfo === 'object' && 'childSocketPath' in restartedInfo
+          ? (restartedInfo as { childSocketPath?: string }).childSocketPath
+          : undefined;
+    }
+
+    if (!socketPath) {
+      throw new Error('Child daemon socket was not available from shell-server process.');
     }
 
     await runDaemonProxy(socketPath);

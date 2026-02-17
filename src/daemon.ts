@@ -6,12 +6,11 @@ import { logger, UdsServerTransport } from '@mako10k/shell-server/runtime';
 import { MCPShellServer } from './server.js';
 
 const DAEMON_COMPONENT = 'mcp-daemon';
-const SOCKET_TIMEOUT_MS = 1000;
 
 async function startMcpDaemon(): Promise<void> {
-  const socketPath = process.env['MCP_SHELL_MCP_SOCKET'];
+  const socketPath = process.env['SHELL_SERVER_CHILD_DAEMON_SOCKET'] || process.env['MCP_SHELL_MCP_SOCKET'];
   if (!socketPath) {
-    throw new Error('MCP socket path is required.');
+    throw new Error('Child daemon socket path is required.');
   }
 
   await fs.mkdir(path.dirname(socketPath), { recursive: true });
@@ -30,10 +29,6 @@ async function startMcpDaemon(): Promise<void> {
     const mcpServer = new MCPShellServer();
     mcpServer.runWithTransport(transport).catch((error) => {
       logger.error('MCP daemon transport failed', { error: String(error) }, DAEMON_COMPONENT);
-    });
-
-    socket.setTimeout(SOCKET_TIMEOUT_MS, () => {
-      socket.destroy();
     });
   });
 

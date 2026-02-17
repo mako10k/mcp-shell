@@ -316,12 +316,10 @@ export class MCPShellServer {
           );
         }
 
-        const dispatchOptions = {
-          ...(process.env['MCP_SHELL_DEFAULT_WORKDIR']
-            ? { defaultWorkingDirectory: process.env['MCP_SHELL_DEFAULT_WORKDIR'] }
-            : {}),
-          fallbackWorkingDirectory: process.cwd(),
-        };
+        const defaultWorkingDirectory = process.env['MCP_SHELL_DEFAULT_WORKDIR'] || process.env['SHELL_SERVER_DEFAULT_WORKDIR'];
+        const dispatchOptions = defaultWorkingDirectory
+          ? { fallbackWorkingDirectory: process.cwd(), defaultWorkingDirectory }
+          : { fallbackWorkingDirectory: process.cwd() };
 
         if (name === 'shell_execute') {
           try {
