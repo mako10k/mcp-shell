@@ -104,7 +104,7 @@ export async function runDaemonProxy(socketPath: string): Promise<void> {
     const code = (error as NodeJS.ErrnoException).code;
     const message = (() => {
       if (code === 'ENOENT') {
-        return 'Daemon socket not found. Start the daemon or check MCP_SHELL_DAEMON_ENABLED.';
+        return 'Daemon socket not found. Start the shell-server daemon process.';
       }
       if (code === 'EACCES') {
         return 'Permission denied connecting to daemon socket. Check file permissions and ownership.';

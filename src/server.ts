@@ -13,7 +13,6 @@ import {
   createShellToolRuntime,
   dispatchToolCall,
   BackofficeServer,
-  MCPShellError,
   ExecutionInfo,
   ShellExecuteParamsSchema,
   ShellGetExecutionParamsSchema,
@@ -64,7 +63,7 @@ export class MCPShellServer {
   constructor() {
     this.server = new Server(
       {
-        name: 'mcp-shell-server',
+        name: 'mcp-shell',
         version: '2.0.0',
       },
       {
@@ -405,7 +404,7 @@ export class MCPShellServer {
           throw error;
         }
       } catch (error) {
-        if (error instanceof MCPShellError) {
+        if (error instanceof Error) {
           throw new McpError(ErrorCode.InvalidRequest, error.message);
         }
         throw error;

@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { MCPShellServer } from './server.js';
 import { runDaemonProxy } from './daemon-proxy.js';
 import { createServerManager, logger } from '@mako10k/shell-server/runtime';
 import fs from 'fs/promises';
@@ -28,13 +27,12 @@ function printHelp(version: string): void {
   const lines = [
     `MCP Shell Server v${version}`,
     '',
-    'Usage: mcp-shell-server [options]',
+    'Usage: mcp-shell [options]',
     '',
     'Options:',
     '  -h, --help           Show this help and exit',
     '  -v, --version        Show version and exit',
-    '  --daemon             Force-enable daemon mode',
-    '  --no-daemon          Disable daemon mode for this run',
+    '  --daemon             Kept for compatibility (default behavior)',
     '',
     'Environment variables:',
     '  BACKOFFICE_ENABLED=true   Start localhost-only Backoffice UI (default: disabled)',
@@ -44,8 +42,6 @@ function printHelp(version: string): void {
     '  MCP_SHELL_DEFAULT_WORKDIR  Default working directory for shell_execute',
     '  MCP_SHELL_ALLOWED_WORKDIRS  Comma-separated allowed directories',
     '  MCP_DISABLED_TOOLS         Comma-separated tool names to disable',
-    '  MCP_SHELL_DAEMON_ENABLED=false Disable daemon process separation (default: enabled)',
-    '  MCP_SHELL_USE_DAEMON_MCP=false  Disable MCP daemon proxy (default: enabled when daemon is on)',
     '  LOG_LEVEL=debug|info|warn|error  Log verbosity',
     '',
     'Related commands (from package scripts):',
@@ -53,7 +49,7 @@ function printHelp(version: string): void {
     '  npm run executor:start     Start standalone executor backend',
     '',
     'Notes:',
-    '  This command runs an MCP server over STDIO. Avoid printing to STDOUT when integrating with MCP clients.',
+    '  This command runs MCP over STDIO and proxies to an external shell-server process.',
   ];
   process.stdout.write(lines.join('\n') + '\n');
 }
@@ -72,56 +68,29 @@ async function main() {
     return;
   }
 
-  // Daemon mode is enabled by default to support auto-start/reattach.
-  // Users can opt-out via env or CLI.
-  const cliNoDaemon = argv.includes('--no-daemon');
-  const cliDaemon = argv.includes('--daemon');
+  try {
+    const cliDaemon = argv.includes('--daemon');
+    if (cliDaemon) {
+      logger.info('`--daemon` is enabled (default behavior).', {}, 'main');
+    }
 
-  const daemonEnabled = !cliNoDaemon && (cliDaemon || process.env['MCP_SHELL_DAEMON_ENABLED'] !== 'false');
-  const useDaemonMcp = process.env['MCP_SHELL_USE_DAEMON_MCP'] !== 'false';
-
-  if (daemonEnabled && useDaemonMcp) {
     const serverManager = createServerManager();
     const cwd = process.env['MCP_SHELL_DEFAULT_WORKDIR'] || process.cwd();
     const started = await serverManager.start({ cwd, allowExisting: true });
     const info = await serverManager.get({ serverId: started.serverId });
-    const socketPath = info?.mcpSocketPath;
+    const mcpSocketPath =
+      info && typeof info === 'object' && 'mcpSocketPath' in info
+        ? (info as { mcpSocketPath?: string }).mcpSocketPath
+        : undefined;
+    const socketPath = mcpSocketPath || info?.socketPath;
+
     if (!socketPath) {
-      throw new Error('MCP daemon socket was not available.');
+      throw new Error('MCP daemon socket was not available from shell-server process.');
     }
 
     await runDaemonProxy(socketPath);
-    return;
-  }
-
-  const server = new MCPShellServer();
-  
-  // グレースフルシャットダウンの設定
-  const cleanup = async () => {
-    // console.error('Shutting down MCP Shell Server...');
-    logger.info('Shutting down MCP Shell Server', {}, 'main');
-    await server.cleanup();
-    process.exit(0);
-  };
-
-  process.on('SIGINT', cleanup);
-  process.on('SIGTERM', cleanup);
-  process.on('uncaughtException', (error) => {
-    // console.error('Uncaught Exception:', error);
-    logger.error('Uncaught Exception', { error: error.message, stack: error.stack }, 'main');
-    cleanup();
-  });
-  process.on('unhandledRejection', (reason, promise) => {
-    // console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    logger.error('Unhandled Rejection', { reason, promise: promise.toString() }, 'main');
-    cleanup();
-  });
-
-  try {
-    await server.run();
   } catch (error) {
-    // console.error('Failed to start MCP Shell Server:', error);
-    logger.error('Failed to start MCP Shell Server', { error: String(error) }, 'main');
+    logger.error('Failed to start shell-server process for MCP proxy', { error: String(error) }, 'main');
     process.exit(1);
   }
 }
