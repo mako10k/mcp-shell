@@ -1,6 +1,6 @@
 {
   "name": "@mako10k/mcp-shell",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server interface for shell-server",
   "type": "module",
   "main": "dist/index.js",
@@ -17,7 +17,12 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "changelog:release": "node scripts/changelog-release.mjs",
+    "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
+    "version:patch": "npm version patch",
+    "version:minor": "npm version minor",
+    "version:major": "npm version major",
     "test:e2e": "npm run build && node --test test/e2e-sdk.test.mjs"
   },
   "author": "mako10k",
@@ -30,12 +35,15 @@
     "url": "https://github.com/mako10k/mcp-shell/issues"
   },
   "homepage": "https://github.com/mako10k/mcp-shell#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@mako10k/shell-server": "^0.2.0",
-    "@modelcontextprotocol/sdk": "1.17.2",
+    "@mako10k/shell-server": "^0.2.4",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.24.5"
   },

@@ -70,7 +70,6 @@ export class MCPShellServer {
         capabilities: {
           tools: {},
           logging: {}, // Enable log notification functionality
-          sampling: {}, // Enable Function Calling and LLM integration capabilities
         },
       }
     );
