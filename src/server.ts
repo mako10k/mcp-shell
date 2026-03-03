@@ -35,6 +35,7 @@ import {
   ServerReattachParamsSchema,
   TerminalOperateParamsSchema,
   logger,
+  type CreateMessageCallback,
   type ShellToolRuntime,
   type ToolName,
   type ToolParams,
@@ -48,6 +49,279 @@ const DISABLED_TOOLS: string[] = (process.env['MCP_DISABLED_TOOLS'] || '')
   .split(',')
   .map((t) => t.trim())
   .filter((t) => t.length > 0);
+
+type LegacyToolCall = {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+};
+
+function normalizeObjectSchema(inputSchema: unknown): {
+  type: 'object';
+  properties: Record<string, unknown>;
+  required?: string[];
+} {
+  const schema = inputSchema && typeof inputSchema === 'object' ? inputSchema as Record<string, unknown> : {};
+  const properties =
+    schema['properties'] && typeof schema['properties'] === 'object'
+      ? schema['properties'] as Record<string, unknown>
+      : {};
+  const required = Array.isArray(schema['required'])
+    ? schema['required'].filter((value): value is string => typeof value === 'string')
+    : undefined;
+
+  return required && required.length > 0
+    ? { type: 'object', properties, required }
+    : { type: 'object', properties };
+}
+
+function extractTextFromContent(content: unknown): string {
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block && typeof block === 'object' && (block as { type?: unknown }).type === 'text')
+      .map((block) => String((block as { text?: unknown }).text ?? ''))
+      .filter((text) => text.length > 0)
+      .join('\n');
+  }
+
+  if (content && typeof content === 'object' && (content as { type?: unknown }).type === 'text') {
+    return String((content as { text?: unknown }).text ?? '');
+  }
+
+  return '';
+}
+
+function extractToolCallsFromArray(calls: unknown[], startIndex: number): LegacyToolCall[] {
+  const toolCalls: LegacyToolCall[] = [];
+
+  for (const call of calls) {
+    if (!call || typeof call !== 'object') {
+      continue;
+    }
+    const callRecord = call as Record<string, unknown>;
+    const fn = callRecord['function'];
+    if (!fn || typeof fn !== 'object') {
+      continue;
+    }
+    const fnRecord = fn as Record<string, unknown>;
+    const name = String(fnRecord['name'] ?? '').trim();
+    if (!name) {
+      continue;
+    }
+    const id = String(callRecord['id'] ?? `call_${startIndex + toolCalls.length + 1}`);
+    const argsRaw = fnRecord['arguments'];
+    const argsString = typeof argsRaw === 'string' ? argsRaw : JSON.stringify(argsRaw ?? {});
+    toolCalls.push({
+      id,
+      type: 'function',
+      function: { name, arguments: argsString },
+    });
+  }
+
+  return toolCalls;
+}
+
+function extractToolCallsFromSamplingResult(result: unknown): LegacyToolCall[] {
+  const toolCalls: LegacyToolCall[] = [];
+  const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : {};
+
+  const topLevelToolCalls = Array.isArray(resultRecord['tool_calls']) ? resultRecord['tool_calls'] : [];
+  toolCalls.push(...extractToolCallsFromArray(topLevelToolCalls, toolCalls.length));
+
+  const content = resultRecord['content'];
+  const blocks = Array.isArray(content) ? content : [content];
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') {
+      continue;
+    }
+    const blockRecord = block as Record<string, unknown>;
+    if (blockRecord['type'] !== 'tool_use') {
+      continue;
+    }
+    const name = String(blockRecord['name'] ?? '').trim();
+    if (!name) {
+      continue;
+    }
+    const id = String(blockRecord['id'] ?? `call_${toolCalls.length + 1}`);
+    const input = blockRecord['input'];
+    toolCalls.push({
+      id,
+      type: 'function',
+      function: {
+        name,
+        arguments: JSON.stringify(input ?? {}),
+      },
+    });
+  }
+
+  // Compatibility: some clients return tool_calls as JSON encoded in text content.
+  if (toolCalls.length === 0) {
+    const rawText = extractTextFromContent(content);
+    if (rawText) {
+      try {
+        const parsed = JSON.parse(rawText) as Record<string, unknown>;
+        const textToolCalls = Array.isArray(parsed['tool_calls']) ? parsed['tool_calls'] : [];
+        toolCalls.push(...extractToolCallsFromArray(textToolCalls, toolCalls.length));
+      } catch {
+        // Ignore non-JSON text payloads.
+      }
+    }
+  }
+
+  const deduped = new Map<string, LegacyToolCall>();
+  for (const call of toolCalls) {
+    deduped.set(`${call.id}:${call.function.name}:${call.function.arguments}`, call);
+  }
+  return [...deduped.values()];
+}
+
+function normalizeStopReason(stopReason: unknown, hasToolCalls: boolean): string | undefined {
+  if (hasToolCalls) {
+    return 'tool_calls';
+  }
+
+  if (stopReason === 'maxTokens') {
+    return 'length';
+  }
+
+  if (typeof stopReason === 'string') {
+    return 'stop';
+  }
+
+  return undefined;
+}
+
+function createSamplingCompatibilityCallback(server: Server): CreateMessageCallback {
+  return async (request) => {
+    const requestRecord = request as unknown as Record<string, unknown>;
+    const messages = Array.isArray(requestRecord['messages']) ? requestRecord['messages'] : [];
+
+    const systemMessages = messages
+      .filter((message) => message && typeof message === 'object' && (message as { role?: unknown }).role === 'system')
+      .map((message) => String(((message as { content?: { text?: unknown } }).content?.text) ?? ''));
+
+    const assistantAndUserMessages = messages
+      .filter((message) => {
+        if (!message || typeof message !== 'object') {
+          return false;
+        }
+        const role = (message as { role?: unknown }).role;
+        return role === 'assistant' || role === 'user';
+      })
+      .map((message) => ({
+        role: (message as { role: 'assistant' | 'user' }).role,
+        content: {
+          type: 'text' as const,
+          text: String(((message as { content?: { text?: unknown } }).content?.text) ?? ''),
+        },
+      }));
+
+    const toolsRaw = Array.isArray(requestRecord['tools']) ? requestRecord['tools'] : [];
+    const tools = toolsRaw
+      .filter((tool) => tool && typeof tool === 'object')
+      .map((tool) => {
+        const functionRecord = (tool as { function?: Record<string, unknown> }).function;
+        const name = String(functionRecord?.['name'] ?? '').trim();
+        if (!name) {
+          return null;
+        }
+        return {
+          name,
+          description: typeof functionRecord?.['description'] === 'string' ? String(functionRecord['description']) : undefined,
+          inputSchema: normalizeObjectSchema(functionRecord?.['parameters']),
+        };
+      })
+      .filter((tool) => tool !== null) as Array<{
+        name: string;
+        description?: string;
+        inputSchema: { type: 'object'; properties: Record<string, unknown>; required?: string[] };
+      }>;
+
+    const rawToolChoice = requestRecord['tool_choice'] ?? requestRecord['toolChoice'];
+    const toolChoiceMode =
+      rawToolChoice === 'auto' || rawToolChoice === 'none'
+        ? rawToolChoice
+        : rawToolChoice && typeof rawToolChoice === 'object'
+          ? 'required'
+          : undefined;
+
+    let systemPrompt = typeof requestRecord['systemPrompt'] === 'string'
+      ? String(requestRecord['systemPrompt'])
+      : undefined;
+    if (!systemPrompt && systemMessages.length > 0) {
+      systemPrompt = systemMessages.join('\n');
+    }
+
+    const mcpRequest: Record<string, unknown> = {
+      messages: assistantAndUserMessages,
+      includeContext:
+        requestRecord['includeContext'] === 'thisServer' ||
+        requestRecord['includeContext'] === 'allServers'
+          ? requestRecord['includeContext']
+          : 'none',
+    };
+
+    if (typeof requestRecord['maxTokens'] === 'number') {
+      mcpRequest['maxTokens'] = requestRecord['maxTokens'];
+    }
+    if (typeof requestRecord['temperature'] === 'number') {
+      mcpRequest['temperature'] = requestRecord['temperature'];
+    }
+    if (Array.isArray(requestRecord['stopSequences'])) {
+      mcpRequest['stopSequences'] = requestRecord['stopSequences'];
+    }
+    if (systemPrompt) {
+      mcpRequest['systemPrompt'] = systemPrompt;
+    }
+    const enableSamplingTools = process.env['MCP_SAMPLING_ENABLE_TOOLS'] === 'true';
+    if (enableSamplingTools) {
+      if (tools.length > 0) {
+        mcpRequest['tools'] = tools;
+      }
+      if (toolChoiceMode) {
+        mcpRequest['toolChoice'] = { mode: toolChoiceMode };
+      }
+    }
+
+    const result = await server.createMessage(mcpRequest as never);
+    const toolCalls = extractToolCallsFromSamplingResult(result);
+    const extractedText = extractTextFromContent((result as { content?: unknown }).content);
+    const responseText =
+      toolCalls.length > 0 && extractedText.length === 0
+        ? JSON.stringify({ tool_calls: toolCalls })
+        : extractedText;
+
+    const response: {
+      content: { type: 'text'; text: string };
+      model?: string;
+      stopReason?: string;
+      tool_calls?: LegacyToolCall[];
+    } = {
+      content: {
+        type: 'text',
+        text: responseText,
+      },
+    };
+
+    if (typeof (result as { model?: unknown }).model === 'string') {
+      response.model = String((result as { model: unknown }).model);
+    }
+
+    const normalizedStopReason = normalizeStopReason((result as { stopReason?: unknown }).stopReason, toolCalls.length > 0);
+    if (normalizedStopReason) {
+      response.stopReason = normalizedStopReason;
+    }
+
+    if (toolCalls.length > 0) {
+      response.tool_calls = toolCalls;
+    }
+
+    return response;
+  };
+}
 
 export class MCPShellServer {
   private server: Server;
@@ -74,7 +348,12 @@ export class MCPShellServer {
       }
     );
 
-    const runtime = createShellToolRuntime({ server: this.server });
+    const runtime = createShellToolRuntime({
+      // Local linked dependencies may pull a second SDK copy, causing private-type mismatch.
+      // Cast at this integration boundary because runtime uses the MCP server shape structurally.
+      server: this.server as never,
+      createMessage: createSamplingCompatibilityCallback(this.server),
+    });
     this.fileManager = runtime.fileManager;
     this.processManager = runtime.processManager;
     this.terminalManager = runtime.terminalManager;
@@ -360,6 +639,87 @@ export class MCPShellServer {
 
         const parsedServerParams = parseServerParams(name, args as ToolParams, dispatchOptions);
         if (parsedServerParams) {
+          if (name === 'server_stop') {
+            const stopParams = parsedServerParams as { server_id: string; force?: boolean };
+            let targetServerId = String(stopParams.server_id || '');
+            let currentServerId: string | undefined;
+            let isCurrentAttachedTarget = false;
+
+            try {
+              const current = await this.serverManager.current();
+              currentServerId = current?.serverId;
+              if (targetServerId === 'local' && currentServerId) {
+                targetServerId = currentServerId;
+              }
+
+              if (currentServerId && targetServerId === currentServerId) {
+                isCurrentAttachedTarget = true;
+              } else if (current && targetServerId) {
+                const targetInfo = await this.serverManager.get({ serverId: targetServerId });
+                if (
+                  targetInfo &&
+                  current.socketPath &&
+                  targetInfo.socketPath &&
+                  current.socketPath === targetInfo.socketPath
+                ) {
+                  isCurrentAttachedTarget = true;
+                }
+              }
+            } catch (error) {
+              logger.warn('Failed to resolve current server before server_stop', { error: String(error) }, 'server');
+            }
+
+            const normalizedStopParams: ToolParams = {
+              ...stopParams,
+              server_id: targetServerId,
+            };
+
+            // If the stop target is the currently attached daemon, return an
+            // acknowledgment first and perform stop asynchronously to avoid
+            // losing this MCP response when transport closes.
+            if (isCurrentAttachedTarget) {
+              setTimeout(() => {
+                void dispatchToolCall(
+                  this.shellTools,
+                  this.serverManager,
+                  name as ToolName,
+                  normalizedStopParams,
+                  dispatchOptions
+                ).catch((error) => {
+                  logger.error('Deferred server_stop failed', { error: String(error), serverId: targetServerId }, 'server');
+                });
+              }, 0);
+
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify(
+                      {
+                        ok: true,
+                        deferred: true,
+                        server_id: targetServerId,
+                        message:
+                          'server_stop was scheduled asynchronously because the target is the active attached daemon. Transport may close shortly after this response.',
+                      },
+                      null,
+                      2
+                    ),
+                  },
+                ],
+              };
+            }
+
+            const result = await dispatchToolCall(
+              this.shellTools,
+              this.serverManager,
+              name as ToolName,
+              normalizedStopParams,
+              dispatchOptions
+            );
+            return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+          }
+
           const result = await dispatchToolCall(
             this.shellTools,
             this.serverManager,

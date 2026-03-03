@@ -3,6 +3,63 @@
 import { runDaemonProxy } from './daemon-proxy.js';
 import { createServerManager, logger } from '@mako10k/shell-server/runtime';
 import fs from 'fs/promises';
+import { existsSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const CHILD_SOCKET_INFO_TIMEOUT_MS = 5000;
+const CHILD_SOCKET_INFO_INTERVAL_MS = 200;
+
+function firstExistingPath(candidates: string[]): string | undefined {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function configureDaemonEntryDefaults(): void {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+  if (!process.env['SHELL_SERVER_DAEMON_ENTRY']) {
+    const daemonCandidates = [
+      // 1) Mono-repo sibling package (preferred in local development)
+      path.resolve(moduleDir, '../../shell-server/dist/daemon/server.js'),
+      // 2) Installed dependency under this package
+      path.resolve(moduleDir, '../node_modules/@mako10k/shell-server/dist/daemon/server.js'),
+    ];
+    const resolvedDaemonEntry = firstExistingPath(daemonCandidates);
+    if (resolvedDaemonEntry) {
+      process.env['SHELL_SERVER_DAEMON_ENTRY'] = resolvedDaemonEntry;
+    } else {
+      logger.warn(
+        'No default shell-server daemon entry was resolved. Set SHELL_SERVER_DAEMON_ENTRY explicitly if startup fails.',
+        { daemonCandidates },
+        'main'
+      );
+    }
+  }
+
+  if (!process.env['SHELL_SERVER_CHILD_DAEMON_ENTRY']) {
+    const childDaemonCandidates = [
+      // Local/package runtime: dist/index.js and dist/daemon.js are siblings.
+      path.resolve(moduleDir, 'daemon.js'),
+      // Fallback for workspace execution from package root.
+      path.resolve(process.cwd(), 'dist/daemon.js'),
+    ];
+    const resolvedChildDaemonEntry = firstExistingPath(childDaemonCandidates);
+    if (resolvedChildDaemonEntry) {
+      process.env['SHELL_SERVER_CHILD_DAEMON_ENTRY'] = resolvedChildDaemonEntry;
+    } else {
+      logger.warn(
+        'No default child daemon entry was resolved. Set SHELL_SERVER_CHILD_DAEMON_ENTRY explicitly if startup fails.',
+        { childDaemonCandidates },
+        'main'
+      );
+    }
+  }
+}
 
 async function getVersion(): Promise<string> {
   // Prefer reading from package.json near dist/index.js
@@ -70,6 +127,8 @@ async function main() {
   }
 
   try {
+    configureDaemonEntryDefaults();
+
     const cliDaemon = argv.includes('--daemon');
     if (cliDaemon) {
       logger.info('`--daemon` is enabled (default behavior).', {}, 'main');
@@ -78,21 +137,33 @@ async function main() {
     const serverManager = createServerManager();
     const cwd = process.env['MCP_SHELL_DEFAULT_WORKDIR'] || process.env['SHELL_SERVER_DEFAULT_WORKDIR'] || process.cwd();
     const started = await serverManager.start({ cwd, allowExisting: true });
-    const info = await serverManager.get({ serverId: started.serverId });
 
-    let socketPath =
-      info && typeof info === 'object' && 'childSocketPath' in info
-        ? (info as { childSocketPath?: string }).childSocketPath
-        : undefined;
+    const resolveChildSocketPath = async (serverId: string): Promise<string | undefined> => {
+      const deadline = Date.now() + CHILD_SOCKET_INFO_TIMEOUT_MS;
+
+      while (Date.now() <= deadline) {
+        const info = await serverManager.get({ serverId });
+        const socketPath =
+          info && typeof info === 'object' && 'childSocketPath' in info
+            ? (info as { childSocketPath?: string }).childSocketPath
+            : undefined;
+
+        if (socketPath) {
+          return socketPath;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, CHILD_SOCKET_INFO_INTERVAL_MS));
+      }
+
+      return undefined;
+    };
+
+    let socketPath = await resolveChildSocketPath(started.serverId);
 
     if (!socketPath) {
       await serverManager.stop({ serverId: started.serverId, force: true });
       const restarted = await serverManager.start({ cwd, allowExisting: false });
-      const restartedInfo = await serverManager.get({ serverId: restarted.serverId });
-      socketPath =
-        restartedInfo && typeof restartedInfo === 'object' && 'childSocketPath' in restartedInfo
-          ? (restartedInfo as { childSocketPath?: string }).childSocketPath
-          : undefined;
+      socketPath = await resolveChildSocketPath(restarted.serverId);
     }
 
     if (!socketPath) {

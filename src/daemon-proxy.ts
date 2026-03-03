@@ -38,6 +38,9 @@ const SOCKET_READY_TIMEOUT_MS = 3000;
 const SOCKET_READY_INTERVAL_MS = 200;
 const TRANSPORT_READY_TIMEOUT_MS = 2000;
 const TRANSPORT_READY_INTERVAL_MS = 200;
+const RECONNECT_BASE_DELAY_MS = 200;
+const RECONNECT_MAX_DELAY_MS = 2000;
+const MAX_QUEUED_MESSAGES = 200;
 
 async function validateSocketPermissions(socketPath: string): Promise<void> {
   const stat = await fs.stat(socketPath);
@@ -77,57 +80,113 @@ async function waitForSocketReady(socketPath: string): Promise<void> {
 }
 
 export async function runDaemonProxy(socketPath: string): Promise<void> {
-  try {
-    await waitForSocketReady(socketPath);
-  } catch (error) {
-    logger.error(
-      'MCP daemon socket validation failed',
-      { error: String(error), socketPath },
-      'daemon-proxy'
-    );
-    throw error;
-  }
-
-  const transport = new UdsClientTransport(socketPath);
   const readBuffer = new ReadBuffer();
+  const outboundQueue: JSONRPCMessage[] = [];
+  let activeTransport: UdsClientTransport | null = null;
+  let reconnectTimer: NodeJS.Timeout | undefined;
+  let reconnectAttempt = 0;
+  let shuttingDown = false;
 
-  transport.onmessage = (message) => {
-    try {
-      const payload = serializeMessage(message as JSONRPCMessage);
-      process.stdout.write(payload);
-    } catch (error) {
-      logger.error('Failed to write daemon message', { error: String(error) }, 'daemon-proxy');
+  const clearReconnectTimer = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
     }
   };
 
-  transport.onerror = (error) => {
-    const code = (error as NodeJS.ErrnoException).code;
-    const message = (() => {
-      if (code === 'ENOENT') {
-        return 'Daemon socket not found. Start the shell-server daemon process.';
-      }
-      if (code === 'EACCES') {
-        return 'Permission denied connecting to daemon socket. Check file permissions and ownership.';
-      }
-      if (code === 'ECONNREFUSED') {
-        return 'Daemon socket refused connection. The daemon may be down.';
-      }
-      return 'Daemon transport error.';
-    })();
+  const closeActiveTransport = async () => {
+    const transport = activeTransport;
+    activeTransport = null;
+    if (!transport) {
+      return;
+    }
+    try {
+      await transport.close();
+    } catch (error) {
+      logger.error('Failed to close daemon proxy transport', { error: String(error) }, 'daemon-proxy');
+    }
+  };
 
-    logger.error(
-      message,
-      { error: String(error), code, socketPath },
+  const scheduleReconnect = (reason: string, error?: unknown) => {
+    if (shuttingDown || reconnectTimer) {
+      return;
+    }
+
+    reconnectAttempt += 1;
+    const delay = Math.min(RECONNECT_BASE_DELAY_MS * (2 ** (reconnectAttempt - 1)), RECONNECT_MAX_DELAY_MS);
+    logger.warn(
+      'Daemon transport disconnected; scheduling reconnect',
+      { reason, delayMs: delay, reconnectAttempt, socketPath, error: error ? String(error) : undefined },
       'daemon-proxy'
     );
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      void connectTransport();
+    }, delay);
   };
 
-  transport.onclose = () => {
-    logger.info('Daemon transport closed', {}, 'daemon-proxy');
-    process.exit(0);
+  const flushQueuedMessages = () => {
+    if (!activeTransport || outboundQueue.length === 0) {
+      return;
+    }
+
+    const pending = outboundQueue.splice(0, outboundQueue.length);
+    for (const message of pending) {
+      activeTransport.send(message).catch((error) => {
+        logger.error('Failed to send queued daemon proxy message', { error: String(error) }, 'daemon-proxy');
+      });
+    }
   };
 
-  const startTransport = async () => {
+  const createTransport = (): UdsClientTransport => {
+    const transport = new UdsClientTransport(socketPath);
+
+    transport.onmessage = (message) => {
+      try {
+        const payload = serializeMessage(message as JSONRPCMessage);
+        process.stdout.write(payload);
+      } catch (error) {
+        logger.error('Failed to write daemon message', { error: String(error) }, 'daemon-proxy');
+      }
+    };
+
+    transport.onerror = (error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      const message = (() => {
+        if (code === 'ENOENT') {
+          return 'Daemon socket not found. Start the shell-server daemon process.';
+        }
+        if (code === 'EACCES') {
+          return 'Permission denied connecting to daemon socket. Check file permissions and ownership.';
+        }
+        if (code === 'ECONNREFUSED') {
+          return 'Daemon socket refused connection. The daemon may be down.';
+        }
+        return 'Daemon transport error.';
+      })();
+
+      logger.error(
+        message,
+        { error: String(error), code, socketPath },
+        'daemon-proxy'
+      );
+    };
+
+    transport.onclose = () => {
+      if (activeTransport === transport) {
+        activeTransport = null;
+      }
+      if (shuttingDown) {
+        return;
+      }
+      scheduleReconnect('transport_closed');
+    };
+
+    return transport;
+  };
+
+  const startTransport = async (transport: UdsClientTransport) => {
     const deadline = Date.now() + TRANSPORT_READY_TIMEOUT_MS;
     let lastError: unknown = null;
 
@@ -149,7 +208,32 @@ export async function runDaemonProxy(socketPath: string): Promise<void> {
     throw lastError || new Error('Timed out waiting for daemon transport.');
   };
 
-  await startTransport();
+  const connectTransport = async () => {
+    if (shuttingDown || activeTransport) {
+      return;
+    }
+
+    try {
+      await waitForSocketReady(socketPath);
+      const transport = createTransport();
+      await startTransport(transport);
+      activeTransport = transport;
+      reconnectAttempt = 0;
+      flushQueuedMessages();
+      logger.info('Daemon proxy transport connected', { socketPath }, 'daemon-proxy');
+    } catch (error) {
+      scheduleReconnect('connect_failed', error);
+    }
+  };
+
+  const shutdown = async () => {
+    shuttingDown = true;
+    clearReconnectTimer();
+    readBuffer.clear();
+    await closeActiveTransport();
+  };
+
+  await connectTransport();
 
   process.stdin.on('data', (chunk) => {
     readBuffer.append(chunk);
@@ -166,16 +250,33 @@ export async function runDaemonProxy(socketPath: string): Promise<void> {
         break;
       }
 
-      transport.send(message).catch((error) => {
-        logger.error('Failed to send daemon proxy message', { error: String(error) }, 'daemon-proxy');
-      });
+      if (activeTransport) {
+        activeTransport.send(message).catch((error) => {
+          logger.error('Failed to send daemon proxy message', { error: String(error) }, 'daemon-proxy');
+        });
+      } else if (outboundQueue.length < MAX_QUEUED_MESSAGES) {
+        outboundQueue.push(message);
+      } else {
+        logger.warn('Dropping daemon proxy message because outbound queue is full', { max: MAX_QUEUED_MESSAGES }, 'daemon-proxy');
+      }
     }
   });
 
   process.stdin.on('close', () => {
-    readBuffer.clear();
-    transport.close().catch((error) => {
-      logger.error('Failed to close daemon proxy transport', { error: String(error) }, 'daemon-proxy');
+    void shutdown().finally(() => {
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGINT', () => {
+    void shutdown().finally(() => {
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGTERM', () => {
+    void shutdown().finally(() => {
+      process.exit(0);
     });
   });
 }
