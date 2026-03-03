@@ -79,16 +79,40 @@ function normalizeObjectSchema(inputSchema: unknown): {
 }
 
 function extractTextFromContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+
   if (Array.isArray(content)) {
     return content
-      .filter((block) => block && typeof block === 'object' && (block as { type?: unknown }).type === 'text')
-      .map((block) => String((block as { text?: unknown }).text ?? ''))
+      .map((block) => {
+        if (typeof block === 'string') {
+          return block;
+        }
+        if (!block || typeof block !== 'object') {
+          return '';
+        }
+        const blockRecord = block as Record<string, unknown>;
+        if (blockRecord['type'] === 'text') {
+          return String(blockRecord['text'] ?? '');
+        }
+        if (typeof blockRecord['text'] === 'string') {
+          return blockRecord['text'];
+        }
+        return '';
+      })
       .filter((text) => text.length > 0)
       .join('\n');
   }
 
-  if (content && typeof content === 'object' && (content as { type?: unknown }).type === 'text') {
-    return String((content as { text?: unknown }).text ?? '');
+  if (content && typeof content === 'object') {
+    const record = content as Record<string, unknown>;
+    if (record['type'] === 'text') {
+      return String(record['text'] ?? '');
+    }
+    if (typeof record['text'] === 'string') {
+      return record['text'];
+    }
   }
 
   return '';
@@ -194,6 +218,48 @@ function normalizeStopReason(stopReason: unknown, hasToolCalls: boolean): string
   return undefined;
 }
 
+function buildLegacyToolCallsPrompt(
+  tools: Array<{ name: string; description?: string; inputSchema: { type: 'object'; properties: Record<string, unknown>; required?: string[] } }>,
+  explicitToolName?: string
+): string {
+  const toolLines = tools
+    .map((tool) => {
+      const schema = JSON.stringify(tool.inputSchema);
+      const description = tool.description ? ` - ${tool.description}` : '';
+      return `- ${tool.name}${description}\n  arguments_schema: ${schema}`;
+    })
+    .join('\n');
+
+  return [
+    'Tool calling fallback mode is active (client does not support sampling.tools).',
+    'You MUST output exactly one JSON object in plain text with this shape:',
+    '{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"<tool_name>","arguments":"<JSON string>"}}]}',
+    'Do not output prose or markdown fences.',
+    explicitToolName
+      ? `Use this tool name for the single call: ${explicitToolName}`
+      : 'Select exactly one tool name from the available tools.',
+    tools.length > 0 ? 'Available tools:' : 'Tool catalog was omitted by the client; infer the best tool from context.',
+    toolLines,
+  ].join('\n');
+}
+
+function buildLegacyToolCallsUserNudge(explicitToolName?: string): string {
+  if (explicitToolName) {
+    return [
+      'Return exactly one plain JSON object (no prose, no markdown).',
+      'Required shape: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"<tool_name>","arguments":"<JSON string>"}}]}',
+      `Set function.name to ${explicitToolName}.`,
+      'Set function.arguments to a valid JSON string for that tool schema.',
+    ].join('\n');
+  }
+
+  return [
+    'Return exactly one plain JSON object (no prose, no markdown).',
+    'Required shape: {"tool_calls":[{"id":"call_1","type":"function","function":{"name":"<tool_name>","arguments":"<JSON string>"}}]}',
+    'Select exactly one available tool and provide valid JSON string arguments.',
+  ].join('\n');
+}
+
 function createSamplingCompatibilityCallback(server: Server): CreateMessageCallback {
   return async (request) => {
     const requestRecord = request as unknown as Record<string, unknown>;
@@ -241,12 +307,57 @@ function createSamplingCompatibilityCallback(server: Server): CreateMessageCallb
       }>;
 
     const rawToolChoice = requestRecord['tool_choice'] ?? requestRecord['toolChoice'];
-    const toolChoiceMode =
-      rawToolChoice === 'auto' || rawToolChoice === 'none'
-        ? rawToolChoice
-        : rawToolChoice && typeof rawToolChoice === 'object'
-          ? 'required'
-          : undefined;
+    const explicitToolChoiceName = (() => {
+      if (
+        typeof rawToolChoice === 'string' &&
+        rawToolChoice !== 'auto' &&
+        rawToolChoice !== 'none' &&
+        rawToolChoice !== 'required' &&
+        rawToolChoice.trim().length > 0
+      ) {
+        return rawToolChoice.trim();
+      }
+
+      if (rawToolChoice && typeof rawToolChoice === 'object') {
+        const raw = rawToolChoice as Record<string, unknown>;
+        const candidates: unknown[] = [
+          raw['name'],
+          raw['toolName'],
+          raw['tool_name'],
+          (raw['function'] as Record<string, unknown> | undefined)?.['name'],
+        ];
+        for (const candidate of candidates) {
+          if (typeof candidate === 'string' && candidate.trim().length > 0) {
+            return candidate.trim();
+          }
+        }
+      }
+
+      return undefined;
+    })();
+    const toolChoiceMode = (() => {
+      if (typeof rawToolChoice === 'string') {
+        if (rawToolChoice === 'auto' || rawToolChoice === 'none' || rawToolChoice === 'required') {
+          return rawToolChoice;
+        }
+        // Some clients send a concrete tool name (e.g. "user_confirm").
+        // MCP sampling supports only mode, so enforce required tool usage.
+        if (rawToolChoice.trim().length > 0) {
+          return 'required';
+        }
+        return undefined;
+      }
+
+      if (rawToolChoice && typeof rawToolChoice === 'object') {
+        const mode = (rawToolChoice as { mode?: unknown }).mode;
+        if (mode === 'auto' || mode === 'none' || mode === 'required') {
+          return mode;
+        }
+        return 'required';
+      }
+
+      return undefined;
+    })();
 
     let systemPrompt = typeof requestRecord['systemPrompt'] === 'string'
       ? String(requestRecord['systemPrompt'])
@@ -276,7 +387,9 @@ function createSamplingCompatibilityCallback(server: Server): CreateMessageCallb
     if (systemPrompt) {
       mcpRequest['systemPrompt'] = systemPrompt;
     }
-    const enableSamplingTools = process.env['MCP_SAMPLING_ENABLE_TOOLS'] === 'true';
+    // Default ON for evaluator compatibility. Explicitly set false only when
+    // troubleshooting providers that fail on tool-enabled sampling.
+    const enableSamplingTools = process.env['MCP_SAMPLING_ENABLE_TOOLS'] !== 'false';
     if (enableSamplingTools) {
       if (tools.length > 0) {
         mcpRequest['tools'] = tools;
@@ -286,8 +399,85 @@ function createSamplingCompatibilityCallback(server: Server): CreateMessageCallb
       }
     }
 
-    const result = await server.createMessage(mcpRequest as never);
-    const toolCalls = extractToolCallsFromSamplingResult(result);
+    let result: unknown;
+    try {
+      result = await server.createMessage(mcpRequest as never);
+    } catch (primaryError) {
+      if (tools.length === 0) {
+        throw primaryError;
+      }
+
+      const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+      logger.warn(
+        'Sampling createMessage with tools failed; retrying with legacy JSON tool_calls fallback',
+        { error: primaryMessage },
+        'server'
+      );
+
+      const fallbackRequest: Record<string, unknown> = {
+        ...mcpRequest,
+      };
+      delete fallbackRequest['tools'];
+      delete fallbackRequest['toolChoice'];
+
+      const fallbackPrompt = buildLegacyToolCallsPrompt(tools);
+      fallbackRequest['systemPrompt'] = systemPrompt
+        ? `${systemPrompt}\n\n${fallbackPrompt}`
+        : fallbackPrompt;
+      fallbackRequest['messages'] = [
+        ...assistantAndUserMessages,
+        {
+          role: 'user',
+          content: {
+            type: 'text' as const,
+            text: buildLegacyToolCallsUserNudge(),
+          },
+        },
+      ];
+
+      try {
+        result = await server.createMessage(fallbackRequest as never);
+      } catch {
+        throw primaryError;
+      }
+    }
+
+    // Some providers sporadically return an empty message even when a required
+    // tool choice was requested. Retry once in JSON fallback mode.
+    let toolCalls = extractToolCallsFromSamplingResult(result);
+    if (toolCalls.length === 0 && toolChoiceMode === 'required') {
+      logger.warn(
+        'Sampling returned no tool call under required tool choice; retrying with legacy JSON tool_calls fallback',
+        { explicitToolChoiceName, toolCount: tools.length },
+        'server'
+      );
+
+      const fallbackRequest: Record<string, unknown> = {
+        ...mcpRequest,
+      };
+      delete fallbackRequest['tools'];
+      delete fallbackRequest['toolChoice'];
+
+      const fallbackPrompt = buildLegacyToolCallsPrompt(tools, explicitToolChoiceName);
+      fallbackRequest['systemPrompt'] = systemPrompt
+        ? `${systemPrompt}\n\n${fallbackPrompt}`
+        : fallbackPrompt;
+      fallbackRequest['messages'] = [
+        ...assistantAndUserMessages,
+        {
+          role: 'user',
+          content: {
+            type: 'text' as const,
+            text: buildLegacyToolCallsUserNudge(explicitToolChoiceName),
+          },
+        },
+      ];
+
+      const fallbackResult = await server.createMessage(fallbackRequest as never);
+      result = fallbackResult;
+      toolCalls = extractToolCallsFromSamplingResult(fallbackResult);
+    }
+
     const extractedText = extractTextFromContent((result as { content?: unknown }).content);
     const responseText =
       toolCalls.length > 0 && extractedText.length === 0

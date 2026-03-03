@@ -40,7 +40,33 @@ const TRANSPORT_READY_TIMEOUT_MS = 2000;
 const TRANSPORT_READY_INTERVAL_MS = 200;
 const RECONNECT_BASE_DELAY_MS = 200;
 const RECONNECT_MAX_DELAY_MS = 2000;
-const MAX_QUEUED_MESSAGES = 200;
+
+function getRequestId(message: JSONRPCMessage): string | number | null | undefined {
+  const candidate = message as unknown as { id?: unknown };
+  const id = candidate.id;
+  if (typeof id === 'string' || typeof id === 'number' || id === null) {
+    return id;
+  }
+  return undefined;
+}
+
+function writeDaemonUnavailableResponse(message: JSONRPCMessage): void {
+  const id = getRequestId(message);
+  if (id === undefined) {
+    return;
+  }
+
+  const payload = {
+    jsonrpc: '2.0',
+    id,
+    error: {
+      code: -32001,
+      message: 'Daemon transport unavailable. Please retry shortly.',
+    },
+  } as const;
+
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+}
 
 async function validateSocketPermissions(socketPath: string): Promise<void> {
   const stat = await fs.stat(socketPath);
@@ -81,7 +107,6 @@ async function waitForSocketReady(socketPath: string): Promise<void> {
 
 export async function runDaemonProxy(socketPath: string): Promise<void> {
   const readBuffer = new ReadBuffer();
-  const outboundQueue: JSONRPCMessage[] = [];
   let activeTransport: UdsClientTransport | null = null;
   let reconnectTimer: NodeJS.Timeout | undefined;
   let reconnectAttempt = 0;
@@ -124,19 +149,6 @@ export async function runDaemonProxy(socketPath: string): Promise<void> {
       reconnectTimer = undefined;
       void connectTransport();
     }, delay);
-  };
-
-  const flushQueuedMessages = () => {
-    if (!activeTransport || outboundQueue.length === 0) {
-      return;
-    }
-
-    const pending = outboundQueue.splice(0, outboundQueue.length);
-    for (const message of pending) {
-      activeTransport.send(message).catch((error) => {
-        logger.error('Failed to send queued daemon proxy message', { error: String(error) }, 'daemon-proxy');
-      });
-    }
   };
 
   const createTransport = (): UdsClientTransport => {
@@ -219,7 +231,6 @@ export async function runDaemonProxy(socketPath: string): Promise<void> {
       await startTransport(transport);
       activeTransport = transport;
       reconnectAttempt = 0;
-      flushQueuedMessages();
       logger.info('Daemon proxy transport connected', { socketPath }, 'daemon-proxy');
     } catch (error) {
       scheduleReconnect('connect_failed', error);
@@ -254,10 +265,9 @@ export async function runDaemonProxy(socketPath: string): Promise<void> {
         activeTransport.send(message).catch((error) => {
           logger.error('Failed to send daemon proxy message', { error: String(error) }, 'daemon-proxy');
         });
-      } else if (outboundQueue.length < MAX_QUEUED_MESSAGES) {
-        outboundQueue.push(message);
       } else {
-        logger.warn('Dropping daemon proxy message because outbound queue is full', { max: MAX_QUEUED_MESSAGES }, 'daemon-proxy');
+        logger.warn('Daemon transport unavailable; returning immediate error response', {}, 'daemon-proxy');
+        writeDaemonUnavailableResponse(message);
       }
     }
   });

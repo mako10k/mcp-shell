@@ -42,7 +42,6 @@ function createSamplingClientTransport() {
     SHELL_SERVER_BRANCH: 's',
     SHELL_SERVER_ENHANCED_MODE: 'true',
     SHELL_SERVER_LLM_EVALUATION: 'true',
-    MCP_SAMPLING_ENABLE_TOOLS: 'true',
   };
 
   return new StdioClientTransport({
@@ -195,28 +194,33 @@ test('SDK E2E: shell_execute with sampling handler (fixed response)', { concurre
     { capabilities: { sampling: { tools: {} } } }
   );
 
-  client.setRequestHandler(CreateMessageRequestSchema, async () => ({
-    model: 'e2e-fixed-model',
-    role: 'assistant',
-    stopReason: 'tool_calls',
-    content: {
-      type: 'text',
-      text: JSON.stringify({
-        tool_calls: [
-          {
-            id: 'call_e2e_sampling_1',
-            type: 'function',
-            function: {
-              name: 'allow',
-              arguments: JSON.stringify({
-                reasoning: '$COMMAND is a safe test command for E2E validation.',
-              }),
+  client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    const hasTools = Array.isArray(request.params.tools) && request.params.tools.length > 0;
+    assert.equal(hasTools, true);
+
+    return {
+      model: 'e2e-fixed-model',
+      role: 'assistant',
+      stopReason: 'tool_calls',
+      content: {
+        type: 'text',
+        text: JSON.stringify({
+          tool_calls: [
+            {
+              id: 'call_e2e_sampling_1',
+              type: 'function',
+              function: {
+                name: 'allow',
+                arguments: JSON.stringify({
+                  reasoning: '$COMMAND is a safe test command for E2E validation.',
+                }),
+              },
             },
-          },
-        ],
-      }),
-    },
-  }));
+          ],
+        }),
+      },
+    };
+  });
 
   await client.connect(transport);
 
@@ -303,3 +307,227 @@ test('SDK E2E: shell_execute with native tool_use response', { concurrency: fals
     await client.close();
   }
 });
+
+test('SDK E2E: shell_execute retry enforces required tool choice', { concurrency: false }, async () => {
+  const transport = createSamplingClientTransport();
+  const client = new Client(
+    { name: 'mcp-shell-e2e-sampling-retry', version: '0.1.0' },
+    { capabilities: { sampling: { tools: {} } } }
+  );
+
+  let callCount = 0;
+  client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    callCount += 1;
+
+    if (callCount === 1) {
+      // Trigger evaluator retry path by returning no tool call.
+      return {
+        model: 'e2e-retry-model',
+        role: 'assistant',
+        stopReason: 'endTurn',
+        content: [{ type: 'text', text: '' }],
+      };
+    }
+
+    const hasTools = Array.isArray(request.params.tools) && request.params.tools.length > 0;
+    assert.equal(hasTools, true);
+    assert.equal(request.params.toolChoice?.mode, 'required');
+
+    return {
+      model: 'e2e-retry-model',
+      role: 'assistant',
+      stopReason: 'toolUse',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'call_e2e_retry_tooluse_1',
+          name: 'allow',
+          input: {
+            reasoning: '$COMMAND is safe after retry forcing a required tool call.',
+          },
+        },
+      ],
+    };
+  });
+
+  await client.connect(transport);
+
+  try {
+    const callResult = await client.callTool({
+      name: 'shell_execute',
+      arguments: {
+        command: 'echo mcp-shell-retry-path',
+        execution_mode: 'foreground',
+        timeout_seconds: 10,
+      },
+    });
+
+    if ('isError' in callResult) {
+      assert.notEqual(callResult.isError, true);
+    }
+    assert.ok(Array.isArray(callResult.content));
+    assert.ok(callResult.content.length > 0);
+
+    const firstContent = callResult.content[0];
+    assert.equal(firstContent.type, 'text');
+
+    const payload = JSON.parse(firstContent.text);
+    assert.equal(typeof payload.execution_id, 'string');
+    assert.ok(payload.execution_id.length > 0);
+    assert.equal(callCount >= 2, true);
+  } finally {
+    await client.close();
+  }
+});
+
+test('SDK E2E: shell_execute fallback works without sampling.tools capability', { concurrency: false }, async () => {
+  const transport = createSamplingClientTransport();
+  const client = new Client(
+    { name: 'mcp-shell-e2e-sampling-legacy-fallback', version: '0.1.0' },
+    { capabilities: { sampling: {} } }
+  );
+
+  client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    const toolsMissing = !Array.isArray(request.params.tools) || request.params.tools.length === 0;
+    assert.equal(toolsMissing, true);
+
+    return {
+      model: 'e2e-legacy-fallback-model',
+      role: 'assistant',
+      stopReason: 'endTurn',
+      content: {
+        type: 'text',
+        text: JSON.stringify({
+          tool_calls: [
+            {
+              id: 'call_e2e_legacy_fallback_1',
+              type: 'function',
+              function: {
+                name: 'allow',
+                arguments: JSON.stringify({
+                  reasoning: '$COMMAND is safe in legacy JSON fallback mode.',
+                }),
+              },
+            },
+          ],
+        }),
+      },
+    };
+  });
+
+  await client.connect(transport);
+
+  try {
+    const callResult = await client.callTool({
+      name: 'shell_execute',
+      arguments: {
+        command: 'echo mcp-shell-legacy-fallback',
+        execution_mode: 'foreground',
+        timeout_seconds: 10,
+      },
+    });
+
+    if ('isError' in callResult) {
+      assert.notEqual(callResult.isError, true);
+    }
+    assert.ok(Array.isArray(callResult.content));
+    assert.ok(callResult.content.length > 0);
+
+    const firstContent = callResult.content[0];
+    assert.equal(firstContent.type, 'text');
+
+    const payload = JSON.parse(firstContent.text);
+    assert.equal(typeof payload.execution_id, 'string');
+    assert.ok(payload.execution_id.length > 0);
+  } finally {
+    await client.close();
+  }
+});
+
+test('SDK E2E: shell_execute retries legacy fallback when required tool choice returns empty', { concurrency: false }, async () => {
+  const transport = createSamplingClientTransport();
+  const client = new Client(
+    { name: 'mcp-shell-e2e-sampling-required-fallback', version: '0.1.0' },
+    { capabilities: { sampling: { tools: {} } } }
+  );
+
+  let callCount = 0;
+  client.setRequestHandler(CreateMessageRequestSchema, async (request) => {
+    callCount += 1;
+
+    if (callCount === 1) {
+      return {
+        model: 'e2e-required-fallback-model',
+        role: 'assistant',
+        stopReason: 'endTurn',
+        content: [{ type: 'text', text: '' }],
+      };
+    }
+
+    if (callCount === 2) {
+      assert.equal(request.params.toolChoice?.mode, 'required');
+      return {
+        model: 'e2e-required-fallback-model',
+        role: 'assistant',
+        stopReason: 'endTurn',
+        content: [{ type: 'text', text: '' }],
+      };
+    }
+
+    const toolsMissing = !Array.isArray(request.params.tools) || request.params.tools.length === 0;
+    assert.equal(toolsMissing, true);
+
+    return {
+      model: 'e2e-required-fallback-model',
+      role: 'assistant',
+      stopReason: 'endTurn',
+      content: {
+        type: 'text',
+        text: JSON.stringify({
+          tool_calls: [
+            {
+              id: 'call_e2e_required_fallback_1',
+              type: 'function',
+              function: {
+                name: 'allow',
+                arguments: JSON.stringify({
+                  reasoning: '$COMMAND is safe when fallback is forced after required tool choice failure.',
+                }),
+              },
+            },
+          ],
+        }),
+      },
+    };
+  });
+
+  await client.connect(transport);
+
+  try {
+    const callResult = await client.callTool({
+      name: 'shell_execute',
+      arguments: {
+        command: 'echo mcp-shell-required-fallback',
+        execution_mode: 'foreground',
+        timeout_seconds: 10,
+      },
+    });
+
+    if ('isError' in callResult) {
+      assert.notEqual(callResult.isError, true);
+    }
+    assert.ok(Array.isArray(callResult.content));
+    assert.ok(callResult.content.length > 0);
+
+    const firstContent = callResult.content[0];
+    assert.equal(firstContent.type, 'text');
+
+    const payload = JSON.parse(firstContent.text);
+    assert.equal(typeof payload.execution_id, 'string');
+    assert.ok(payload.execution_id.length > 0);
+    assert.equal(callCount, 3);
+  } finally {
+    await client.close();
+  }
+});
+
